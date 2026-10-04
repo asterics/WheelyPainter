@@ -1,317 +1,218 @@
 /*
- * Differential-drive wheel odometry on a generic ESP32 DevKit (30 pin).
- * Pinout see: https://www.robotics.org.za/ESP32-DEV
+ * Fast optical flow on ESP32-CAM (OV2640), camera pointing at the floor.
+ * pinout see: https://www.az-delivery.de/en/products/esp32-cam-modul-esp32-wifi-bluetooth-modul-inklusive-kamera
+ * manual see: https://cdn.shopify.com/s/files/1/1509/1638/files/ESP32-Cam_datasheet.pdf?v=1689236064
  *
- * Inputs : two wheel encoders. For now they are SIMULATED by two potentiometers:
- *          wiper position = wheel speed, mid position = standing still.
- *            left  pot wiper -> GPIO35   (ADC1)
- *            right pot wiper -> GPIO34   (ADC1)
- *            pot outer pins  -> 3V3 and GND
- *          Set SIMULATED_ENCODERS to 0 to use real quadrature encoders instead.
+ * Method : 3x3 grid of 24x24 template blocks, SAD block matching (+/-8 px search,
+ *          2x subsampled), parabolic sub-pixel refinement, median over valid blocks.
+ * Image  : 160x120 8-bit grayscale, both frame buffers kept in internal SRAM.
+ * Output : "t_ms,dx_mm,dy_mm,x_mm,y_mm,n_valid" per frame on Serial and in /flow.csv
+ *          (the 6-column format understood by path_viewer.py)
  *
- * Output : "t_ms,dx_mm,dy_mm,x_mm,y_mm,n_valid,heading_deg" per sample on Serial and in the recording file
- *            dx, dy      = platform displacement since the last sample, in mm
- *            x, y        = accumulated position in mm (start = 0,0, initial heading = +Y = "up")
- *            n_valid     = number of valid wheels (2)
- *            heading_deg = platform heading, 0 = +Y, positive = clockwise (right turn), -180..180
- *          Every second a "# v=.. w=.. hdg=.." comment line (speed, turn rate, heading) is sent.
+ * Units / signs: the measured shift of the floor texture in the image (pixels) is converted to
+ * millimetres on the floor (MM_PER_PX, see CAM_HEIGHT_MM / CAM_HFOV_DEG) and its sign is inverted,
+ * so dx/dy describe the motion of the PLATFORM: +x = right, +y = forward ("up" in the viewer),
+ * assuming the top of the camera image points forward. If your camera is mounted differently use
+ * "Invert X" / "Invert Y" in the viewer.
  *
- * Recording: a short press of the button on GPIO13 (to GND) or the serial command 'p' starts /
- *            pauses the recording (and the live serial output). Every new recording goes to a new
- *            file /rec_001.csv, /rec_002.csv, ... in flash. The internal LED (GPIO2) blinks while
- *            recording. A long press (1 s) or 'd' replays (dumps) the recordings over serial, one
- *            file per press, wrapping around. 'w' deletes all recordings.
- *
- * Serial commands: p = start/pause recording + live output (same as short button press)
- *                  d = replay next recording (same as long button press)
- *                  w = delete all recordings
- *                  r = reset position/heading
- *                  c = set current pot positions as "zero" (simulation)
- *                  s = toggle steering (wheel difference rotates the platform)
+ * Serial commands:  p = toggle live print   d = replay (dump) the log   w = delete the log
+ *                   r = reset position      x = same as w (old name)
  */
 
 #include <Arduino.h>
-#include <LittleFS.h>
 #include <math.h>
-#include <vector>
-#include <algorithm>
+#include "esp_camera.h"
 #include "esp_timer.h"
-#include "driver/gpio.h"
+#include <LittleFS.h>
 
 // ------------------------------------------------------------------ settings
-#define SIMULATED_ENCODERS 1
+static constexpr int W = 160;               // FRAMESIZE_QQVGA
+static constexpr int H = 120;
 
-static constexpr int SAMPLE_HZ = 20;                // odometry / output rate
+static constexpr int BS = 24;               // block size
+static constexpr int SR = 8;                // search range (+/- px) -> max ~8 px/frame
+static constexpr int STEP = 2;              // pixel subsampling inside SAD
+static constexpr int NS = 2 * SR + 1;
+static constexpr int NBX = 3, NBY = 3;
+static const int BX[NBX] = {16, 68, 120};   // block origins (keep SR margin to the border)
+static const int BY[NBY] = {12, 48, 84};
 
-// Mechanics (adjust to your platform)
-// Wheelchair - these are placeholders, MEASURE YOURS.
-// The encoders are pressed against the tyres, so the distance per count is set by the diameter
-// of the small measuring roller on the encoder shaft (not by the wheelchair wheel), assuming no slip.
-static constexpr float WHEEL_DIAMETER_MM = 50.0f;   // diameter of the encoder roller
-static constexpr float TRACK_WIDTH_MM = 560.0f;     // distance between the two wheelchair wheel contact points
+static constexpr uint32_t TEX_MIN = 400;                                 // min texture of a block
+static constexpr uint32_t MAX_SAD = (BS / STEP) * (BS / STEP) * 25;      // reject bad matches
+static constexpr int MIN_VALID_BLOCKS = 3;
 
-// --- simulation (potentiometers)
-static constexpr int POT_L_PIN = 35;
-static constexpr int POT_R_PIN = 34;
-static constexpr float SIM_MAX_SPEED_MM_S = 1000.0f; // wheel speed at full pot deflection
-static constexpr int POT_DEADBAND = 80;             // ADC counts around mid = no movement
-static constexpr int POT_HALF_RANGE = 1900;         // ADC counts from mid to "full speed"
-static int potMidL = 2048, potMidR = 2048;          // can be re-centred with the 'c' command
+// Camera geometry: pixels -> millimetres on the floor (the viewer expects mm).
+// This is only a first estimate - CALIBRATE: push the platform a known distance (e.g. 2 m) and
+// correct CAM_HEIGHT_MM by (true distance / measured distance).
+static constexpr float CAM_HEIGHT_MM = 300.0f;      // distance lens -> floor
+static constexpr float CAM_HFOV_DEG = 65.0f;        // horizontal field of view (OV2640 lenses: ~60..70 deg)
+static const float MM_PER_PX = 2.0f * CAM_HEIGHT_MM * tanf(CAM_HFOV_DEG * PI / 360.0f) / W;
 
-// --- real encoders (quadrature, 4x decoding)
-static constexpr int ENCODER_PPR = 360;             // pulses per revolution per channel
-static constexpr int ENC_L_A = 25, ENC_L_B = 26;
-static constexpr int ENC_R_A = 32, ENC_R_B = 33;
-static constexpr int ENC_LEFT_SIGN = 1;             // set to -1 if a wheel counts backwards when driving forward
-static constexpr int ENC_RIGHT_SIGN = 1;            // (the right encoder is usually mirrored -> -1)
-static constexpr float MM_PER_COUNT = PI * WHEEL_DIAMETER_MM / (4.0f * ENCODER_PPR);
+// Manual exposure (reduces motion blur on a fast platform). 0 = auto exposure.
+// Typical OV2640 range 0..1200. Needs enough light on the floor!
+#define MANUAL_EXPOSURE 0
+#define MANUAL_GAIN 10                      // 0..30, only used with manual exposure
 
-// --- button and LED
-static constexpr int BTN_PIN = 13;                  // push button between GPIO13 and GND (internal pull-up)
-static constexpr int LED_PIN = 2;                   // internal LED of the ESP32 DevKit
-static constexpr uint32_t DEBOUNCE_MS = 40;
-static constexpr uint32_t LONG_PRESS_MS = 1000;     // press longer than this = replay
-static constexpr uint32_t BLINK_MS = 250;           // LED toggles every 250 ms while recording
-
-// --- recording
+static const char *LOG_PATH = "/flow.csv";
 static constexpr size_t LOG_BUF = 4096;
 static constexpr uint32_t LOG_FLUSH_MS = 2000;
-static constexpr size_t LOG_MAX_BYTES = 1000000;    // one recording stops at ~1 MB
-static constexpr size_t MIN_FREE_BYTES = 65536;     // do not start a recording with less free flash
+static constexpr size_t LOG_MAX_BYTES = 1000000;   // stop logging at ~1 MB (partition is ~1.4 MB)
+
+// AI-Thinker / AZ Delivery ESP32-CAM pinout
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
 
 // ------------------------------------------------------------------ globals
-struct OdoSample {
+struct FlowSample {
   uint32_t t_ms;
-  float dx, dy;     // displacement since last sample [mm]
-  float x, y;       // accumulated position [mm]
-  uint8_t n;        // number of valid wheels
-  float h;          // heading [deg], 0 = +Y, clockwise positive, -180..180
+  float dx, dy;     // platform motion since the last frame [mm]
+  float x, y;       // accumulated platform motion [mm]
+  uint8_t n;        // number of valid blocks
 };
 
-static QueueHandle_t sampleQueue;
+static QueueHandle_t flowQueue;
 static SemaphoreHandle_t fsMutex;
 static volatile bool streamEnabled = true;
-static volatile bool recording = false;      // file recording active (LED blinks)
-static volatile bool loggerPending = false;  // logger task still holds unwritten samples
-static char recPath[24] = "";                // file of the current / last recording
-static volatile uint32_t recSession = 0;     // incremented for every new recording
-static int replayIdx = 0;                    // next recording to replay
+static volatile bool loggingEnabled = true;
 static volatile bool resetPos = false;
-static volatile bool calibrateReq = false;
 static volatile uint32_t droppedSamples = 0;
 
-// Steering = let the DIFFERENCE between the two wheels rotate the platform.
-// ON by default. Press 's' to switch it off: the platform then only drives straight along +Y/-Y
-// with the average of both wheels, which is handy to check the signs of the pots.
-static volatile bool steering = true;
-
-// debug values shown in the status line (raw ADC value of the pots / encoder counts)
-static volatile int dbgRawL = 0, dbgRawR = 0;
-
-// ------------------------------------------------------------------ wheel input
-#if SIMULATED_ENCODERS
-
-static int readAveraged(int pin) {
-  uint32_t acc = 0;
-  for (int i = 0; i < 16; i++) acc += analogRead(pin);
-  return 4096-(int)(acc / 16);
+// ------------------------------------------------------------------ optical flow
+static inline uint32_t sadBlock(const uint8_t *a, const uint8_t *b) {
+  uint32_t s = 0;
+  for (int y = 0; y < BS; y += STEP) {
+    const uint8_t *pa = a + y * W;
+    const uint8_t *pb = b + y * W;
+    for (int x = 0; x < BS; x += STEP) {
+      int d = (int)pa[x] - (int)pb[x];
+      s += (d < 0) ? -d : d;
+    }
+  }
+  return s;
 }
 
-// raw ADC value -> -1..+1 with dead band around the mid position
-static float potToNorm(int raw, int mid) {
-  int d = raw - mid;
-  if (abs(d) <= POT_DEADBAND) return 0.0f;
-  d += (d > 0) ? -POT_DEADBAND : POT_DEADBAND;
-  float n = (float)d / (float)(POT_HALF_RANGE - POT_DEADBAND);
-  return constrain(n, -1.0f, 1.0f);
+// Finds where the block at (bx,by) of `prev` moved to in `cur`.
+static bool matchBlock(const uint8_t *prev, const uint8_t *cur, int bx, int by,
+                       float &ox, float &oy) {
+  const uint8_t *tpl = prev + by * W + bx;
+
+  // texture check: flat blocks cannot be tracked
+  uint32_t tex = 0;
+  for (int y = 0; y < BS - STEP; y += STEP) {
+    for (int x = 0; x < BS - STEP; x += STEP) {
+      int v = tpl[y * W + x];
+      int gx = v - tpl[y * W + x + STEP];
+      int gy = v - tpl[(y + STEP) * W + x];
+      tex += (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
+    }
+  }
+  if (tex < TEX_MIN) return false;
+
+  uint32_t map[NS][NS];
+  uint32_t best = UINT32_MAX, sum = 0;
+  int bi = 0, bj = 0;
+  for (int j = 0; j < NS; j++) {
+    for (int i = 0; i < NS; i++) {
+      const uint8_t *c = cur + (by + j - SR) * W + (bx + i - SR);
+      uint32_t s = sadBlock(tpl, c);
+      map[j][i] = s;
+      sum += s;
+      if (s < best) { best = s; bi = i; bj = j; }
+    }
+  }
+
+  float mean = (float)sum / (NS * NS);
+  if (best > MAX_SAD || (float)best > 0.8f * mean) return false;   // bad / ambiguous match
+
+  float fx = (float)(bi - SR), fy = (float)(bj - SR);
+
+  // parabolic sub-pixel refinement
+  if (bi > 0 && bi < NS - 1) {
+    float a = map[bj][bi - 1], b = map[bj][bi], c = map[bj][bi + 1];
+    float d = a - 2 * b + c;
+    if (d > 0) fx += constrain(0.5f * (a - c) / d, -0.5f, 0.5f);
+  }
+  if (bj > 0 && bj < NS - 1) {
+    float a = map[bj - 1][bi], b = map[bj][bi], c = map[bj + 1][bi];
+    float d = a - 2 * b + c;
+    if (d > 0) fy += constrain(0.5f * (a - c) / d, -0.5f, 0.5f);
+  }
+  ox = fx;
+  oy = fy;
+  return true;
 }
 
-static void initWheelInput() {
-  analogReadResolution(12);
-  analogSetPinAttenuation(POT_L_PIN, ADC_11db);
-  analogSetPinAttenuation(POT_R_PIN, ADC_11db);
-  Serial.printf("# SIMULATED encoders: pots on GPIO%d (left) / GPIO%d (right)\n", POT_L_PIN, POT_R_PIN);
+static float medianOf(float *v, int n) {
+  for (int i = 1; i < n; i++) {
+    float k = v[i];
+    int j = i - 1;
+    while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = k;
+  }
+  return (n & 1) ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
 }
 
-static void calibrateInput() {
-  potMidL = readAveraged(POT_L_PIN);
-  potMidR = readAveraged(POT_R_PIN);
-  Serial.printf("# pot centre set: L=%d R=%d\n", potMidL, potMidR);
+static int computeFlow(const uint8_t *prev, const uint8_t *cur, float &dx, float &dy) {
+  float vx[NBX * NBY], vy[NBX * NBY];
+  int n = 0;
+  for (int j = 0; j < NBY; j++) {
+    for (int i = 0; i < NBX; i++) {
+      float fx, fy;
+      if (matchBlock(prev, cur, BX[i], BY[j], fx, fy)) { vx[n] = fx; vy[n] = fy; n++; }
+    }
+  }
+  if (n < MIN_VALID_BLOCKS) { dx = dy = 0; return 0; }
+  dx = medianOf(vx, n);
+  dy = medianOf(vy, n);
+  return n;
 }
-
-// distance travelled by each wheel during the last dt seconds [mm]
-static void readWheelDeltas(float dt, float &dL, float &dR) {
-  dbgRawL = readAveraged(POT_L_PIN);
-  dbgRawR = readAveraged(POT_R_PIN);
-  dL = potToNorm(dbgRawL, potMidL) * SIM_MAX_SPEED_MM_S * dt;
-  dR = potToNorm(dbgRawR, potMidR) * SIM_MAX_SPEED_MM_S * dt;
-}
-
-#else  // real quadrature encoders
-
-struct Quad {
-  uint8_t pinA, pinB;
-  volatile int32_t count;
-  volatile uint8_t state;
-};
-static Quad encL = {ENC_L_A, ENC_L_B, 0, 0};
-static Quad encR = {ENC_R_A, ENC_R_B, 0, 0};
-
-// index = (previous state << 2) | new state, state = (A << 1) | B
-static const DRAM_ATTR int8_t QUAD_TABLE[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
-
-static void IRAM_ATTR quadISR(void *arg) {
-  Quad *q = (Quad *)arg;
-  uint8_t s = (uint8_t)((gpio_get_level((gpio_num_t)q->pinA) << 1) | gpio_get_level((gpio_num_t)q->pinB));
-  q->count += QUAD_TABLE[(q->state << 2) | s];
-  q->state = s;
-}
-
-static void attachQuad(Quad &q) {
-  pinMode(q.pinA, INPUT_PULLUP);
-  pinMode(q.pinB, INPUT_PULLUP);
-  q.state = (uint8_t)((digitalRead(q.pinA) << 1) | digitalRead(q.pinB));
-  attachInterruptArg(q.pinA, quadISR, &q, CHANGE);
-  attachInterruptArg(q.pinB, quadISR, &q, CHANGE);
-}
-
-static void initWheelInput() {
-  attachQuad(encL);
-  attachQuad(encR);
-  Serial.println("# REAL encoders enabled");
-}
-
-static void calibrateInput() {}
-
-static void readWheelDeltas(float dt, float &dL, float &dR) {
-  (void)dt;
-  static int32_t lastL = 0, lastR = 0;
-  int32_t cl = encL.count, cr = encR.count;
-  dbgRawL = cl;
-  dbgRawR = cr;
-  dL = ENC_LEFT_SIGN * (float)(cl - lastL) * MM_PER_COUNT;
-  dR = ENC_RIGHT_SIGN * (float)(cr - lastR) * MM_PER_COUNT;
-  lastL = cl;
-  lastR = cr;
-}
-
-#endif
 
 // ------------------------------------------------------------------ helpers
-static int fmtSample(char *out, size_t cap, const OdoSample &s) {
-  return snprintf(out, cap, "%lu,%.3f,%.3f,%.2f,%.2f,%u,%.2f\n", (unsigned long)s.t_ms, s.dx,
-                  s.dy, s.x, s.y, s.n, s.h);
+static int fmtSample(char *out, size_t cap, const FlowSample &s) {
+  return snprintf(out, cap, "%lu,%.3f,%.3f,%.2f,%.2f,%u\n", (unsigned long)s.t_ms, s.dx, s.dy,
+                  s.x, s.y, s.n);
 }
 
-static const char *CSV_HEADER = "# recording; t_ms,dx_mm,dy_mm,x_mm,y_mm,n_valid,heading_deg\n";
+static const char *CSV_HEADER = "# session start; t_ms,dx_mm,dy_mm,x_mm,y_mm,n_valid\n";
 
-static bool isRecFile(const String &n) { return n.startsWith("rec_") && n.endsWith(".csv"); }
-
-// Sorted names of all recordings (without leading '/'). Caller must hold fsMutex.
-static std::vector<String> listRecordings() {
-  std::vector<String> v;
-  File root = LittleFS.open("/");
-  if (!root) return v;
-  for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-    String n = f.name();
-    if (n.startsWith("/")) n = n.substring(1);
-    if (!f.isDirectory() && isRecFile(n)) v.push_back(n);
-  }
-  root.close();
-  std::sort(v.begin(), v.end());
-  return v;
-}
-
-// Append samples to a recording file (called by the logger task only).
-static void flushLog(const char *path, const char *data, size_t len) {
+static void appendToLog(const char *data, size_t len) {
   xSemaphoreTake(fsMutex, portMAX_DELAY);
-  bool ok = false;
-  size_t sz = 0;
-  File f = LittleFS.open(path, FILE_APPEND);
+  File f = LittleFS.open(LOG_PATH, FILE_APPEND);
   if (f) {
-    ok = f.write((const uint8_t *)data, len) == len;
-    sz = f.size();
+    f.write((const uint8_t *)data, len);
+    size_t sz = f.size();
     f.close();
-  }
-  xSemaphoreGive(fsMutex);
-
-  if (!ok) {
-    recording = false;
-    Serial.println("# ERROR: cannot write file (flash full?) - recording stopped, send 'w' to delete recordings");
-  } else if (sz > LOG_MAX_BYTES && recording) {
-    recording = false;
-    Serial.println("# file full - recording stopped");
-  }
-}
-
-static void startRecording() {
-  if (recording) return;
-  xSemaphoreTake(fsMutex, portMAX_DELAY);
-
-  size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
-  if (freeBytes < MIN_FREE_BYTES) {
-    xSemaphoreGive(fsMutex);
-    Serial.println("# flash full - cannot start, send 'w' to delete all recordings");
-    return;
-  }
-
-  int maxN = 0;                                       // new file = highest number + 1
-  for (const String &n : listRecordings()) {
-    int k = 0;
-    if (sscanf(n.c_str(), "rec_%d.csv", &k) == 1 && k > maxN) maxN = k;
-  }
-  char path[24];
-  snprintf(path, sizeof(path), "/rec_%03d.csv", maxN + 1);
-
-  File f = LittleFS.open(path, FILE_WRITE);
-  if (!f) {
-    xSemaphoreGive(fsMutex);
-    Serial.printf("# ERROR: cannot create %s\n", path);
-    return;
-  }
-  f.print(CSV_HEADER);
-  f.close();
-  strlcpy(recPath, path, sizeof(recPath));
-  recSession++;
-  xSemaphoreGive(fsMutex);
-
-  xQueueReset(sampleQueue);                           // drop samples from before the start
-  streamEnabled = true;
-  recording = true;
-  Serial.printf("# recording started: %s\n", path);
-}
-
-static void stopRecording() {
-  if (!recording) return;
-  recording = false;
-  uint32_t t0 = millis();                             // wait until the logger has written everything
-  while (loggerPending && millis() - t0 < 500) vTaskDelay(pdMS_TO_TICKS(10));
-
-  xSemaphoreTake(fsMutex, portMAX_DELAY);
-  File f = LittleFS.open(recPath, FILE_READ);
-  size_t sz = f ? f.size() : 0;
-  if (f) f.close();
-  xSemaphoreGive(fsMutex);
-  Serial.printf("# recording stopped: %s (%u bytes)\n", recPath, (unsigned)sz);
-}
-
-// short button press and 'p' command
-static void toggleRecording() {
-  if (recording) {
-    stopRecording();
-    streamEnabled = false;
+    if (sz > LOG_MAX_BYTES && loggingEnabled) {
+      loggingEnabled = false;
+      Serial.println("# log file full, logging stopped (send 'w' to delete the log)");
+    }
   } else {
-    startRecording();
+    Serial.println("# ERROR: cannot open log file");
   }
+  xSemaphoreGive(fsMutex);
 }
 
-static void dumpFile(const String &name) {
+static void dumpLog() {
   bool prev = streamEnabled;
   streamEnabled = false;
-  digitalWrite(LED_PIN, HIGH);                        // LED on while dumping
   xSemaphoreTake(fsMutex, portMAX_DELAY);
-  File f = LittleFS.open("/" + name, FILE_READ);
-  Serial.printf("# ---- BEGIN LOG %s ----\n", name.c_str());
+  File f = LittleFS.open(LOG_PATH, FILE_READ);
+  Serial.println("# replay 1/1");                                   // only one log file in this version
+  Serial.printf("# ---- BEGIN LOG %s ----\n", LOG_PATH + 1);
   if (f) {
     uint8_t tmp[256];
     while (f.available()) {
@@ -323,143 +224,131 @@ static void dumpFile(const String &name) {
   }
   Serial.println("# ---- END LOG ----");
   xSemaphoreGive(fsMutex);
-  digitalWrite(LED_PIN, LOW);
   streamEnabled = prev;
 }
 
-// long button press and 'd' command: dump the next recording, wrap around after the last one
-static void replayNext() {
-  if (recording) {
-    Serial.println("# stop the recording first (p / short press) before replaying");
-    return;
-  }
+static void clearLog() {
   xSemaphoreTake(fsMutex, portMAX_DELAY);
-  std::vector<String> files = listRecordings();
+  LittleFS.remove(LOG_PATH);
   xSemaphoreGive(fsMutex);
-  if (files.empty()) {
-    Serial.println("# no recordings");
-    return;
-  }
-  int idx = replayIdx % (int)files.size();
-  replayIdx = idx + 1;
-  Serial.printf("# replay %d/%d\n", idx + 1, (int)files.size());
-  dumpFile(files[idx]);
+  appendToLog(CSV_HEADER, strlen(CSV_HEADER));
+  loggingEnabled = true;
+  Serial.println("# log cleared");
 }
 
-// 'w' command
-static void wipeRecordings() {
-  if (recording) {
-    Serial.println("# stop the recording first (p / short press) before deleting");
-    return;
-  }
-  xSemaphoreTake(fsMutex, portMAX_DELAY);
-  int n = 0;
-  for (const String &name : listRecordings())
-    if (LittleFS.remove("/" + name)) n++;
-  LittleFS.remove("/flow.csv");                       // file of older firmware versions
-  xSemaphoreGive(fsMutex);
-  replayIdx = 0;
-  Serial.printf("# %d recording(s) deleted\n", n);
-}
+// ------------------------------------------------------------------ camera
+static bool initCamera() {
+  camera_config_t c = {};
+  c.ledc_channel = LEDC_CHANNEL_0;
+  c.ledc_timer = LEDC_TIMER_0;
+  c.pin_d0 = Y2_GPIO_NUM;
+  c.pin_d1 = Y3_GPIO_NUM;
+  c.pin_d2 = Y4_GPIO_NUM;
+  c.pin_d3 = Y5_GPIO_NUM;
+  c.pin_d4 = Y6_GPIO_NUM;
+  c.pin_d5 = Y7_GPIO_NUM;
+  c.pin_d6 = Y8_GPIO_NUM;
+  c.pin_d7 = Y9_GPIO_NUM;
+  c.pin_xclk = XCLK_GPIO_NUM;
+  c.pin_pclk = PCLK_GPIO_NUM;
+  c.pin_vsync = VSYNC_GPIO_NUM;
+  c.pin_href = HREF_GPIO_NUM;
+  c.pin_sccb_sda = SIOD_GPIO_NUM;
+  c.pin_sccb_scl = SIOC_GPIO_NUM;
+  c.pin_pwdn = PWDN_GPIO_NUM;
+  c.pin_reset = RESET_GPIO_NUM;
+  c.xclk_freq_hz = 20000000;
+  c.pixel_format = PIXFORMAT_GRAYSCALE;
+  c.frame_size = FRAMESIZE_QQVGA;
+  c.jpeg_quality = 12;                       // unused for grayscale
+  c.fb_count = 2;
+  c.fb_location = CAMERA_FB_IN_PSRAM;
+  c.grab_mode = CAMERA_GRAB_LATEST;          // always the newest frame, never a stale one
 
-// Button: short press (release before LONG_PRESS_MS) = start/pause, long press = replay next file
-static void handleButton() {
-  static bool down = false, longDone = false;
-  static uint32_t t0 = 0;
-  bool pressed = digitalRead(BTN_PIN) == LOW;
-  uint32_t now = millis();
+  esp_err_t err = esp_camera_init(&c);
+  if (err != ESP_OK) {
+    Serial.printf("# camera init failed: 0x%x\n", err);
+    return false;
+  }
 
-  if (pressed && !down) {
-    down = true;
-    longDone = false;
-    t0 = now;
-  } else if (pressed && down) {
-    if (!longDone && now - t0 >= LONG_PRESS_MS) {
-      longDone = true;
-      replayNext();
-    }
-  } else if (!pressed && down) {
-    down = false;
-    if (!longDone && now - t0 >= DEBOUNCE_MS) toggleRecording();
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+#if MANUAL_EXPOSURE > 0
+    s->set_exposure_ctrl(s, 0);
+    s->set_aec_value(s, MANUAL_EXPOSURE);
+    s->set_gain_ctrl(s, 0);
+    s->set_agc_gain(s, MANUAL_GAIN);
+#else
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_gainceiling(s, GAINCEILING_8X);
+#endif
   }
-}
-
-// LED: blinking while recording, otherwise off
-static void updateLed() {
-  static uint32_t last = 0;
-  static bool on = false;
-  if (!recording) {
-    if (on) { digitalWrite(LED_PIN, LOW); on = false; }
-    return;
-  }
-  uint32_t now = millis();
-  if (now - last >= BLINK_MS) {
-    last = now;
-    on = !on;
-    digitalWrite(LED_PIN, on ? HIGH : LOW);
-  }
+  return true;
 }
 
 // ------------------------------------------------------------------ tasks
-// Differential-drive odometry. Heading th is measured clockwise from +Y ("up" in the viewer).
-static void odometryTask(void *) {
-  float x = 0, y = 0, th = 0;
-  float v = 0;                                     // for the status line
-  const TickType_t period = pdMS_TO_TICKS(1000 / SAMPLE_HZ);
-  TickType_t wake = xTaskGetTickCount();
-  int64_t tPrev = esp_timer_get_time();
-  uint32_t lastStat = millis();
+static void visionTask(void *) {
+  uint8_t *prev = (uint8_t *)heap_caps_malloc(W * H, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint8_t *cur = (uint8_t *)heap_caps_malloc(W * H, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!prev || !cur) {
+    Serial.println("# out of internal RAM");
+    vTaskDelete(NULL);
+  }
+
+  bool havePrev = false;
+  float accX = 0, accY = 0;
+  uint32_t frames = 0, procUs = 0, lastStat = millis();
   char line[72];
 
   for (;;) {
-    vTaskDelayUntil(&wake, period);
-    int64_t now = esp_timer_get_time();
-    float dt = (float)(now - tPrev) * 1e-6f;
-    tPrev = now;
-
-    if (calibrateReq) { calibrateInput(); calibrateReq = false; }
-    if (resetPos) { x = y = th = 0; resetPos = false; }
-
-    float dL, dR;
-    readWheelDeltas(dt, dL, dR);
-
-    float ds = 0.5f * (dL + dR);                   // distance travelled by the platform centre
-    float dth = steering ? (dL - dR) / TRACK_WIDTH_MM : 0.0f;   // left faster than right -> turn clockwise
-    float mid = th + 0.5f * dth;                   // midpoint integration
-    float dx = ds * sinf(mid);
-    float dy = ds * cosf(mid);
-    x += dx;
-    y += dy;
-    th += dth;
-    if (dt > 0) v = ds / dt;
-
-    float hdg = fmodf(th * 180.0f / PI, 360.0f);
-    if (hdg > 180.0f) hdg -= 360.0f;
-    if (hdg < -180.0f) hdg += 360.0f;
-
-    OdoSample s;
-    s.t_ms = (uint32_t)(now / 1000);
-    s.dx = dx;
-    s.dy = dy;
-    s.x = x;
-    s.y = y;
-    s.n = 2;
-    s.h = hdg;
-
-    if (streamEnabled) {
-      int n = fmtSample(line, sizeof(line), s);
-      Serial.write((const uint8_t *)line, n);
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { vTaskDelay(1); continue; }
+    if (fb->width != W || fb->height != H || fb->len != (size_t)(W * H)) {
+      esp_camera_fb_return(fb);
+      vTaskDelay(1);
+      continue;
     }
-    if (xQueueSend(sampleQueue, &s, 0) != pdTRUE) droppedSamples++;
+    uint32_t tMs = (uint32_t)(esp_timer_get_time() / 1000);
+    memcpy(cur, fb->buf, W * H);             // PSRAM -> internal SRAM
+    esp_camera_fb_return(fb);                // give the buffer back to the driver ASAP
 
-    uint32_t ms = millis();
-    if (ms - lastStat >= 500) {
-      lastStat = ms;
-      float vL = dt > 0 ? dL / dt : 0, vR = dt > 0 ? dR / dt : 0;
+    if (resetPos) { accX = accY = 0; resetPos = false; }
+
+    if (havePrev) {
+      int64_t t0 = esp_timer_get_time();
+      FlowSample s;
+      s.n = (uint8_t)computeFlow(prev, cur, s.dx, s.dy);
+      procUs += (uint32_t)(esp_timer_get_time() - t0);
+      // floor shift in the image [px] -> platform motion [mm]: the platform moves opposite to the
+      // floor, and the image y axis points down while the viewer's y axis points forward/up
+      s.dx = -s.dx * MM_PER_PX;
+      s.dy = s.dy * MM_PER_PX;
+      accX += s.dx;
+      accY += s.dy;
+      s.t_ms = tMs;
+      s.x = accX;
+      s.y = accY;
+
+      if (streamEnabled) {
+        int n = fmtSample(line, sizeof(line), s);
+        Serial.write((const uint8_t *)line, n);
+      }
+      if (xQueueSend(flowQueue, &s, 0) != pdTRUE) droppedSamples++;
+      frames++;
+    }
+    uint8_t *t = prev; prev = cur; cur = t;
+    havePrev = true;
+
+    uint32_t now = millis();
+    if (now - lastStat >= 2000) {
       if (streamEnabled)
-        Serial.printf("# L raw=%d %.0f mm/s | R raw=%d %.0f mm/s | v=%.0f mm/s hdg=%.1f deg steer=%s rec=%s\n",
-                      (int)dbgRawL, vL, (int)dbgRawR, vR, v, hdg, steering ? "on" : "off",
-                      recording ? "on" : "off");
+        Serial.printf("# fps=%.1f flow=%lu us/frame dropped=%lu\n",
+                      frames * 1000.0f / (now - lastStat),
+                      frames ? (unsigned long)(procUs / frames) : 0UL,
+                      (unsigned long)droppedSamples);
+      frames = 0; procUs = 0; lastStat = now;
     }
   }
 }
@@ -467,36 +356,16 @@ static void odometryTask(void *) {
 static void loggerTask(void *) {
   static char buf[LOG_BUF];
   size_t len = 0;
-  char myPath[24] = "";
-  uint32_t mySession = 0;
   uint32_t lastFlush = millis();
-  OdoSample s;
+  FlowSample s;
 
   for (;;) {
-    bool got = xQueueReceive(sampleQueue, &s, pdMS_TO_TICKS(50)) == pdTRUE;
-
-    // a new recording was started: finish the old buffer, then switch to the new file
-    xSemaphoreTake(fsMutex, portMAX_DELAY);
-    uint32_t sess = recSession;
-    char newPath[24];
-    strlcpy(newPath, recPath, sizeof(newPath));
-    xSemaphoreGive(fsMutex);
-    if (sess != mySession) {
-      if (len > 0 && myPath[0]) flushLog(myPath, buf, len);
-      len = 0;
-      strlcpy(myPath, newPath, sizeof(myPath));
-      mySession = sess;
-      lastFlush = millis();
+    if (xQueueReceive(flowQueue, &s, pdMS_TO_TICKS(200)) == pdTRUE && loggingEnabled) {
+      if (len + 72 < LOG_BUF) len += fmtSample(buf + len, LOG_BUF - len, s);
     }
-
-    if (got && recording && len + 72 < LOG_BUF) len += fmtSample(buf + len, LOG_BUF - len, s);
-    loggerPending = len > 0;
-
-    // write when the buffer is full, every LOG_FLUSH_MS, or immediately after the recording stopped
-    if (len > 0 && (!recording || len > LOG_BUF - 160 || millis() - lastFlush >= LOG_FLUSH_MS)) {
-      flushLog(myPath, buf, len);
+    if (len > 0 && (len > LOG_BUF - 160 || millis() - lastFlush >= LOG_FLUSH_MS)) {
+      appendToLog(buf, len);
       len = 0;
-      loggerPending = false;
       lastFlush = millis();
     }
   }
@@ -506,43 +375,35 @@ static void loggerTask(void *) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n# ESP32 wheel odometry");
-
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  pinMode(BTN_PIN, INPUT_PULLUP);
+  Serial.println("\n# ESP32-CAM optical flow");
 
   if (!LittleFS.begin(true)) {               // true = format on first use
     Serial.println("# LittleFS mount failed");
   }
   fsMutex = xSemaphoreCreateMutex();
-  sampleQueue = xQueueCreate(128, sizeof(OdoSample));
+  flowQueue = xQueueCreate(128, sizeof(FlowSample));
+  appendToLog(CSV_HEADER, strlen(CSV_HEADER));
 
-  xSemaphoreTake(fsMutex, portMAX_DELAY);
-  size_t nFiles = listRecordings().size();
-  xSemaphoreGive(fsMutex);
-  Serial.printf("# %u recording(s) in flash. Short press / 'p' = start/pause, long press / 'd' = replay, 'w' = delete all\n",
-                (unsigned)nFiles);
+  if (!initCamera()) {
+    delay(2000);
+    ESP.restart();
+  }
 
-  initWheelInput();
-
-  xTaskCreatePinnedToCore(odometryTask, "odometry", 4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(visionTask, "vision", 8192, NULL, 3, NULL, 1);
   xTaskCreatePinnedToCore(loggerTask, "logger", 6144, NULL, 1, NULL, 0);
 }
 
 void loop() {
   while (Serial.available()) {
     switch (Serial.read()) {
-      case 'p': toggleRecording(); break;
-      case 'd': replayNext(); break;
-      case 'w': wipeRecordings(); break;
+      case 'd': dumpLog(); break;
+      case 'w':
+      case 'x': clearLog(); break;                // 'w' is sent by the viewer's "Delete all files"
       case 'r': resetPos = true; Serial.println("# position reset"); break;
-      case 'c': calibrateReq = true; break;
-      case 's': steering = !steering; Serial.printf("# steering %s\n", steering ? "on" : "off"); break;
+      case 'p': streamEnabled = !streamEnabled; break;
+      case 'c': Serial.println("# 'c' (centre pots) is not used in the optical flow version"); break;
       default: break;
     }
   }
-  handleButton();
-  updateLed();
   vTaskDelay(pdMS_TO_TICKS(20));
 }
