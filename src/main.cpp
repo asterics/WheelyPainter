@@ -39,7 +39,7 @@
 #include "driver/gpio.h"
 
 // ------------------------------------------------------------------ settings
-#define SIMULATED_ENCODERS 1
+#define SIMULATED_ENCODERS 0
 
 static constexpr int SAMPLE_HZ = 20;                // odometry / output rate
 
@@ -59,9 +59,10 @@ static constexpr int POT_HALF_RANGE = 1900;         // ADC counts from mid to "f
 static int potMidL = 2048, potMidR = 2048;          // can be re-centred with the 'c' command
 
 // --- real encoders (quadrature, 4x decoding)
-static constexpr int ENCODER_PPR = 360;             // pulses per revolution per channel
-static constexpr int ENC_L_A = 25, ENC_L_B = 26;
-static constexpr int ENC_R_A = 32, ENC_R_B = 33;
+static constexpr int ENCODER_PPR = 10; //360;             // pulses per revolution per channel
+static constexpr int ENC_L_GND = 12, ENC_L_A = 27, ENC_L_B = 14;
+static constexpr int ENC_R_GND = 26, ENC_R_A = 33, ENC_R_B = 25;
+
 static constexpr int ENC_LEFT_SIGN = 1;             // set to -1 if a wheel counts backwards when driving forward
 static constexpr int ENC_RIGHT_SIGN = 1;            // (the right encoder is usually mirrored -> -1)
 static constexpr float MM_PER_COUNT = PI * WHEEL_DIAMETER_MM / (4.0f * ENCODER_PPR);
@@ -150,12 +151,12 @@ static void readWheelDeltas(float dt, float &dL, float &dR) {
 #else  // real quadrature encoders
 
 struct Quad {
-  uint8_t pinA, pinB;
+  uint8_t pinA, pinB, pinGND;
   volatile int32_t count;
   volatile uint8_t state;
 };
-static Quad encL = {ENC_L_A, ENC_L_B, 0, 0};
-static Quad encR = {ENC_R_A, ENC_R_B, 0, 0};
+static Quad encL = {ENC_L_A, ENC_L_B, ENC_L_GND, 0};
+static Quad encR = {ENC_R_A, ENC_R_B, ENC_R_GND, 0};
 
 // index = (previous state << 2) | new state, state = (A << 1) | B
 static const DRAM_ATTR int8_t QUAD_TABLE[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
@@ -168,6 +169,8 @@ static void IRAM_ATTR quadISR(void *arg) {
 }
 
 static void attachQuad(Quad &q) {
+  pinMode(q.pinGND, OUTPUT);
+  digitalWrite(q.pinGND, LOW);
   pinMode(q.pinA, INPUT_PULLUP);
   pinMode(q.pinB, INPUT_PULLUP);
   q.state = (uint8_t)((digitalRead(q.pinA) << 1) | digitalRead(q.pinB));
