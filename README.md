@@ -1,6 +1,6 @@
 # Wheelchair Odometry – ESP32 firmware + Path Viewer
 
-Dead-reckoning for a wheelchair using **two wheel encoders** (one on each drive wheel).
+Odometry for a wheelchair using **two wheel encoders** (one on each drive wheel).
 The ESP32 turns the encoder signals into a position and heading, streams them over USB,
 and records them to its internal flash. A small Python/Tk program draws the path live,
 replays recordings from the board, and exports the path as an SVG for printing on A3.
