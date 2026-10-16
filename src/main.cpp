@@ -47,7 +47,7 @@ static constexpr int SAMPLE_HZ = 20;                // odometry / output rate
 // Wheelchair - these are placeholders, MEASURE YOURS.
 // The encoders are pressed against the tyres, so the distance per count is set by the diameter
 // of the small measuring roller on the encoder shaft (not by the wheelchair wheel), assuming no slip.
-static constexpr float WHEEL_DIAMETER_MM = 50.0f;   // diameter of the encoder roller
+static constexpr float WHEEL_DIAMETER_MM = 56.5f;   // diameter of the encoder roller
 static constexpr float TRACK_WIDTH_MM = 560.0f;     // distance between the two wheelchair wheel contact points
 
 // --- simulation (potentiometers)
@@ -59,13 +59,16 @@ static constexpr int POT_HALF_RANGE = 1900;         // ADC counts from mid to "f
 static int potMidL = 2048, potMidR = 2048;          // can be re-centred with the 'c' command
 
 // --- real encoders (quadrature, 4x decoding)
-static constexpr int ENCODER_PPR = 10; //360;             // pulses per revolution per channel
-static constexpr int ENC_L_GND = 12, ENC_L_A = 27, ENC_L_B = 14;
-static constexpr int ENC_R_GND = 26, ENC_R_A = 33, ENC_R_B = 25;
+static constexpr int ENCODER_PPR = 600; //360;             // pulses per revolution per channel
+static constexpr int ENC_R_A = 14, ENC_R_B = 27;
+static constexpr int ENC_L_A = 25, ENC_L_B = 26;
 
 static constexpr int ENC_LEFT_SIGN = 1;             // set to -1 if a wheel counts backwards when driving forward
 static constexpr int ENC_RIGHT_SIGN = 1;            // (the right encoder is usually mirrored -> -1)
 static constexpr float MM_PER_COUNT = PI * WHEEL_DIAMETER_MM / (4.0f * ENCODER_PPR);
+// Right wheel distance is multiplied by this. Tune on a straight drive: path drifts right -> increase,
+// drifts left -> decrease. (1.0 = no compensation; e.g. 1.02 if the right encoder counts 2% too few)
+static constexpr float RIGHT_WHEEL_COMP = 1.020f;
 
 // --- button and LED
 static constexpr int BTN_PIN = 13;                  // push button between GPIO13 and GND (internal pull-up)
@@ -151,12 +154,12 @@ static void readWheelDeltas(float dt, float &dL, float &dR) {
 #else  // real quadrature encoders
 
 struct Quad {
-  uint8_t pinA, pinB, pinGND;
+  uint8_t pinA, pinB;
   volatile int32_t count;
   volatile uint8_t state;
 };
-static Quad encL = {ENC_L_A, ENC_L_B, ENC_L_GND, 0};
-static Quad encR = {ENC_R_A, ENC_R_B, ENC_R_GND, 0};
+static Quad encL = {ENC_L_A, ENC_L_B, 0};
+static Quad encR = {ENC_R_A, ENC_R_B, 0};
 
 // index = (previous state << 2) | new state, state = (A << 1) | B
 static const DRAM_ATTR int8_t QUAD_TABLE[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
@@ -169,10 +172,8 @@ static void IRAM_ATTR quadISR(void *arg) {
 }
 
 static void attachQuad(Quad &q) {
-  pinMode(q.pinGND, OUTPUT);
-  digitalWrite(q.pinGND, LOW);
-  pinMode(q.pinA, INPUT_PULLUP);
-  pinMode(q.pinB, INPUT_PULLUP);
+  pinMode(q.pinA, INPUT);  // note: use external pullups to 3V3!
+  pinMode(q.pinB, INPUT);
   q.state = (uint8_t)((digitalRead(q.pinA) << 1) | digitalRead(q.pinB));
   attachInterruptArg(q.pinA, quadISR, &q, CHANGE);
   attachInterruptArg(q.pinB, quadISR, &q, CHANGE);
@@ -193,7 +194,7 @@ static void readWheelDeltas(float dt, float &dL, float &dR) {
   dbgRawL = cl;
   dbgRawR = cr;
   dL = ENC_LEFT_SIGN * (float)(cl - lastL) * MM_PER_COUNT;
-  dR = ENC_RIGHT_SIGN * (float)(cr - lastR) * MM_PER_COUNT;
+  dR = ENC_RIGHT_SIGN * (float)(cr - lastR) * MM_PER_COUNT * RIGHT_WHEEL_COMP;
   lastL = cl;
   lastR = cr;
 }
