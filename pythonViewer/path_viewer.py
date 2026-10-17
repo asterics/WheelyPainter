@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Live path viewer for the ESP32 wheel-odometry firmware (wheelchair).
+Live path viewer for the ESP32 wheel-odometry firmware (wheelchair, wheel encoders + gyro).
 
 Reads lines of the form
     t_ms,dx_mm,dy_mm,x_mm,y_mm,n_valid,heading_deg
@@ -42,10 +42,6 @@ EXPORT_TOLERANCE_MM = 2.0     # SVG export: thin out points, max. deviation from
 EXPORT_PAGE_MM = (420.0, 297.0)   # A3; orientation (landscape/portrait) is chosen automatically
 EXPORT_MARGIN_MM = 15.0       # free border on the sheet
 EXPORT_STROKE_MM = 0.5        # line width on the sheet
-
-# SVG export
-EXPORT_SIZE = 1000.0          # longer side of the exported path in SVG units
-EXPORT_MIN_SPACING = 1.0      # minimum distance between exported nodes (0 = keep every sample)
 
 
 # --------------------------------------------------------------------------- serial thread
@@ -197,7 +193,6 @@ class App:
         self.btn_stop = ttk.Button(bar, text="Stop", command=self.stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Clear path / center", command=self.clear).pack(side=tk.LEFT, padx=(12, 2))
-        ttk.Button(bar, text="Center pots", command=self.center_pots).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Export", command=self.export_svg).pack(side=tk.LEFT, padx=(12, 2))
 
         bar2 = ttk.Frame(self.root, padding=(6, 0, 6, 6))
@@ -221,6 +216,14 @@ class App:
         ttk.Button(bar3, text="Replay next", command=self.replay_next).pack(side=tk.LEFT, padx=(8, 2))
         ttk.Button(bar3, text="Delete all files", command=self.wipe_files).pack(side=tk.LEFT, padx=2)
         ttk.Label(bar3, text="(start/pause recording: button on the board or 'p'; replay = long press or 'd')",
+                  foreground="#666").pack(side=tk.LEFT, padx=8)
+
+        bar4 = ttk.Frame(self.root, padding=(6, 0, 6, 6))
+        bar4.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(bar4, text="Gyro:").pack(side=tk.LEFT)
+        ttk.Button(bar4, text="Calibrate gyro", command=self.calibrate_gyro).pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Button(bar4, text="Heading source", command=self.toggle_heading_source).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bar4, text="(calibrate with the chair standing still; heading source: gyro <-> encoders only)",
                   foreground="#666").pack(side=tk.LEFT, padx=8)
 
         self.canvas = tk.Canvas(self.root, bg="#fafafa", highlightthickness=0)
@@ -259,11 +262,18 @@ class App:
         self.btn_stop.config(state=tk.NORMAL)
         self.status_var.set(f"Connecting to {dev} ...")
 
-    def center_pots(self):
-        """Tell the firmware to take the current pot positions as 'no movement' ('c' command)."""
+    def calibrate_gyro(self):
+        """Ask the firmware to measure the gyro offset ('g' command). The chair must stand still."""
         if self.reader and self.reader.ser:
-            self.reader.send(b"c")
-            self.flash("Centering pots ...")
+            self.reader.send(b"g")
+            self.flash("Calibrating gyro - keep the chair still ...", 4.0)
+        else:
+            self.status_var.set("Not connected - press Start first")
+
+    def toggle_heading_source(self):
+        """Switch the firmware heading between gyro and encoders only ('h' command)."""
+        if self.reader and self.reader.ser:
+            self.reader.send(b"h")
         else:
             self.status_var.set("Not connected - press Start first")
 
@@ -345,9 +355,9 @@ class App:
                     self.last_info = val
                     if val.startswith("replay "):
                         self.replay_hint = val[len("replay "):]
-                    if val.startswith("L raw="):         # periodic status line
+                    if val.startswith("status "):        # periodic status line
                         if time.time() >= self.flash_until and self.reader and not self.replay_active:
-                            self.status_var.set(f"Connected - {val}")
+                            self.status_var.set(f"Connected - {val[len('status '):]}")
                     else:                                # messages from the firmware (recording, delete, ...)
                         self.flash(val, 4.0)
                 elif kind == "error":
